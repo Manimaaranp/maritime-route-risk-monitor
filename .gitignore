@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# Environment variables and secrets
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Operating system
+.DS_Store
+
+# Logs
+*.log
+
+# Spark checkpoints
+checkpoints/
+
+# Local database
+*.db
+*.sqlite
+*.sqlite3
