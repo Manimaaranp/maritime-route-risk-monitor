@@ -79,9 +79,7 @@ def fetch_weather():
         timestamp
         for timestamp in marine_times
         if timestamp in weather_index
-        and parse_utc(timestamp) >= now.replace(
-            minute=0, second=0, microsecond=0
-        )
+        and parse_utc(timestamp) > now
     ]
 
     if not matching_times:
