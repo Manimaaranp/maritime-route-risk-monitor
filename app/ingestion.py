@@ -5,7 +5,9 @@ import logging
 import os
 import random
 import time
-import uuid
+import hashlib
+import re
+import math
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,72 +57,148 @@ logging.basicConfig(
 logger = logging.getLogger("maritime-ingestion")
 
 
+
+
+
 # --------------------------------------------------
-# Weather cache
+# Multi-location weather cache
 # --------------------------------------------------
 
-weather_cache = None
+WEATHER_CELLS = {
+    "southern": {
+        "latitude": 52.5,
+        "longitude": 3.5,
+    },
+    "central": {
+        "latitude": 56.0,
+        "longitude": 3.0,
+    },
+    "northern": {
+        "latitude": 59.0,
+        "longitude": 2.0,
+    },
+    "german_bight": {
+        "latitude": 54.0,
+        "longitude": 7.0,
+    },
+}
+
+weather_cache = {}
 
 
 async def refresh_weather():
-    """Refresh the cached forecast periodically."""
+    """Refresh each geographical weather cell independently."""
 
     global weather_cache
 
     while True:
-        try:
-            logger.info("Fetching latest Open-Meteo forecast...")
+        for cell_id, location in WEATHER_CELLS.items():
+            try:
+                logger.info(
+                    "Fetching weather for cell: %s",
+                    cell_id,
+                )
 
-            forecast = await asyncio.to_thread(fetch_weather)
+                forecast = await asyncio.to_thread(
+                    fetch_weather,
+                    location["latitude"],
+                    location["longitude"],
+                )
 
-            weather_cache = forecast
+                weather_cache[cell_id] = forecast
 
-            logger.info(
-                "Weather forecast updated. Valid time: %s",
-                forecast["forecast_timestamp"],
-            )
+                logger.info(
+                    "Weather updated for %s. Valid time: %s",
+                    cell_id,
+                    forecast["forecast_timestamp"],
+                )
 
-        except Exception as error:
-            logger.error(
-                "Weather refresh failed: %s: %s",
-                type(error).__name__,
-                error,
-            )
+            except Exception as error:
+                logger.error(
+                    "Weather refresh failed for %s: %s: %s",
+                    cell_id,
+                    type(error).__name__,
+                    error,
+                )
 
         await asyncio.sleep(WEATHER_REFRESH_SECONDS)
 
 
 
-def get_fresh_weather():
-    """Return cached weather only if it is fresh and still valid."""
-
-    if weather_cache is None:
-        return None
+def get_fresh_weather(latitude, longitude):
+    """Return the nearest weather forecast that is currently valid."""
 
     now = datetime.now(timezone.utc)
 
-    retrieved_at = datetime.fromisoformat(
-        weather_cache["retrieved_at"]
-    )
+    nearest_cell = None
+    nearest_forecast = None
+    nearest_distance = float("inf")
 
-    forecast_timestamp = datetime.fromisoformat(
-        weather_cache["forecast_timestamp"]
-    )
+    for cell_id, location in WEATHER_CELLS.items():
+        forecast = weather_cache.get(cell_id)
 
-    retrieval_age = (now - retrieved_at).total_seconds()
+        # Skip cells without cached forecasts.
+        if forecast is None:
+            continue
 
-    if retrieval_age > WEATHER_MAX_AGE_SECONDS:
-        logger.warning("Cached weather forecast is stale.")
-        return None
+        try:
+            retrieved_at = datetime.fromisoformat(
+                forecast["retrieved_at"]
+            )
+            forecast_timestamp = datetime.fromisoformat(
+                forecast["forecast_timestamp"]
+            )
+            if retrieved_at.tzinfo is None or forecast_timestamp.tzinfo is None:
+                logger.warning(
+                    "Weather timestamps lack timezone information for cell %s.",
+                    cell_id,
+                )
+                continue
+        except (KeyError, ValueError, TypeError):
+            logger.warning(
+                "Invalid weather timestamps for cell %s.",
+                cell_id,
+            )
+            continue
 
-    if forecast_timestamp <= now:
-        logger.warning(
-            "Cached forecast validity has expired. "
-            "Waiting for the next weather refresh."
+        # Skip forecasts with invalid or stale retrieval times.
+        retrieval_age = (now - retrieved_at).total_seconds()
+
+        if retrieval_age < 0 or retrieval_age > WEATHER_MAX_AGE_SECONDS:
+            logger.warning("Weather cache is stale for cell %s.", cell_id)
+            continue
+
+        # Skip forecasts that have already expired.
+        if forecast_timestamp <= now:
+            logger.warning("Weather forecast expired for cell %s.", cell_id)
+            continue
+
+        lat_difference = latitude - location["latitude"]
+        lon_difference = longitude - location["longitude"]
+
+        adjusted_lon_difference = (
+            lon_difference * math.cos(math.radians(latitude))
         )
+
+        distance = (
+            lat_difference ** 2
+            + adjusted_lon_difference ** 2
+        )
+
+        if distance < nearest_distance:
+            nearest_distance = distance
+            nearest_cell = cell_id
+            nearest_forecast = forecast
+
+    if nearest_forecast is None:
         return None
 
-    return weather_cache
+    return {
+        "cell_id": nearest_cell,
+        **nearest_forecast,
+    }
+
+
 
 
 
@@ -137,8 +215,56 @@ def is_valid_number(value):
     )
 
 
+
+def parse_source_timestamp(value):
+    """Normalize an AISStream source timestamp to UTC ISO 8601."""
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    try:
+        normalized = value.strip()
+
+        # Remove AISStream's trailing UTC label.
+        if normalized.endswith(" UTC"):
+            normalized = normalized[:-4]
+
+        # Convert timezone offsets such as +0000 to +00:00.
+        normalized = re.sub(
+            r"\s([+-]\d{2})(\d{2})$",
+            r"\1:\2",
+            normalized,
+        )
+
+        # Python datetime supports microsecond precision.
+        normalized = re.sub(
+            r"([.,]\d{6})\d+",
+            r"\1",
+            normalized,
+        )
+
+        parsed = datetime.fromisoformat(normalized)
+
+        if parsed.tzinfo is None:
+            logger.warning(
+                "AIS source timestamp has no timezone: %s",
+                value,
+            )
+            return None
+
+        return parsed.astimezone(timezone.utc).isoformat()
+
+    except ValueError:
+        logger.warning(
+            "Invalid AIS source timestamp: %s",
+            value,
+        )
+        return None
+
+
+
 def build_vessel_event(message):
-    """Validate an AIS position report and build a Kafka event."""
+    """Validate an AIS position report and build a traceable Kafka event."""
 
     if message.get("MessageType") != "PositionReport":
         return None
@@ -153,7 +279,6 @@ def build_vessel_event(message):
     latitude = metadata.get("Latitude")
     longitude = metadata.get("Longitude")
 
-    # Fall back to coordinates inside the AIS payload
     if latitude is None:
         latitude = ais_message.get("Latitude")
 
@@ -180,36 +305,71 @@ def build_vessel_event(message):
     latitude = float(latitude)
     longitude = float(longitude)
 
-    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+    if not (
+        -90 <= latitude <= 90
+        and -180 <= longitude <= 180
+    ):
         logger.warning(
             "Discarding AIS event for MMSI %s: coordinates out of range.",
             mmsi,
         )
         return None
 
-    # AISStream metadata time_utc is preserved as received.
-    # PositionReport.Timestamp is only the AIS UTC second field,
-    # not a complete date/time.
-    source_timestamp = metadata.get("time_utc")
+    # Canonical representation of the original AISStream message.
+    canonical_message = json.dumps(
+        message,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
 
+    # Deterministic event identity.
+    event_id = hashlib.sha256(
+        canonical_message.encode("utf-8")
+    ).hexdigest()
+
+    source_timestamp_raw = metadata.get("time_utc")
+    source_timestamp = parse_source_timestamp(source_timestamp_raw)
     ingestion_timestamp = datetime.now(timezone.utc).isoformat()
 
     event = {
-        "event_id": str(uuid.uuid4()),
+        "event_id": event_id,
+        "schema_version": 1,
         "mmsi": mmsi,
         "vessel_name": metadata.get("ShipName"),
         "latitude": latitude,
         "longitude": longitude,
-        "speed_over_ground": ais_message.get("Sog"),
-        "course_over_ground": ais_message.get("Cog"),
-        "heading": ais_message.get("TrueHeading"),
+        "speed_over_ground": (
+            ais_message.get("Sog")
+             if is_valid_number(ais_message.get("Sog"))
+            and 0 <= ais_message.get("Sog") <= 102.2
+            else None
+        ),
+
+        "course_over_ground": (
+            ais_message.get("Cog")
+            if is_valid_number(ais_message.get("Cog"))
+            and 0 <= ais_message.get("Cog") < 360
+            else None
+        ),
+
+        "heading": (
+            ais_message.get("TrueHeading")
+            if isinstance(ais_message.get("TrueHeading"), int)
+            and not isinstance(ais_message.get("TrueHeading"), bool)
+            and 0 <= ais_message.get("TrueHeading") <= 359
+            else None
+        ),
         "event_timestamp": source_timestamp,
+        "source_timestamp_raw": source_timestamp_raw,
         "ais_timestamp_second": ais_message.get("Timestamp"),
         "ingestion_timestamp": ingestion_timestamp,
-        "weather": get_fresh_weather(),
+        "raw_message": message,
+        "weather": get_fresh_weather(latitude, longitude),
     }
 
     return event
+
 
 
 # --------------------------------------------------

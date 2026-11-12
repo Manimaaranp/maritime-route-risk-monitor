@@ -31,12 +31,12 @@ def parse_utc(timestamp):
     return parsed.astimezone(timezone.utc)
 
 
-def fetch_weather():
+def fetch_weather(latitude=LATITUDE, longitude=LONGITUDE):
     """Fetch marine and atmospheric forecasts for the North Sea reference point."""
 
     marine_params = {
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
+        "latitude": latitude,
+        "longitude": longitude,
         "hourly": (
             "wave_height,"
             "wave_period,"
@@ -50,8 +50,8 @@ def fetch_weather():
     }
 
     weather_params = {
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
+        "latitude": latitude,
+        "longitude": longitude,
         "hourly": "wind_speed_10m,wind_gusts_10m",
         "forecast_days": 2,
         "timezone": "GMT",
@@ -99,8 +99,8 @@ def fetch_weather():
 
     result = {
         "reference_location": {
-            "latitude": LATITUDE,
-            "longitude": LONGITUDE,
+            "latitude": latitude,
+            "longitude": longitude,
         },
         "forecast_timestamp": parse_utc(
             forecast_timestamp
