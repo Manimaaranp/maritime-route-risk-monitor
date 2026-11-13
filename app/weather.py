@@ -79,13 +79,34 @@ def fetch_weather(latitude=LATITUDE, longitude=LONGITUDE):
         timestamp
         for timestamp in marine_times
         if timestamp in weather_index
-        and parse_utc(timestamp) > now
     ]
 
-    if not matching_times:
-        raise ValueError("No matching future forecast timestamp found.")
+    valid_times = [
+        timestamp
+        for timestamp in matching_times
+        if parse_utc(timestamp) <= now
+        and (now - parse_utc(timestamp)).total_seconds() <= 3600
+    ]
 
-    forecast_timestamp = matching_times[0]
+    future_times = [
+        timestamp
+        for timestamp in matching_times
+        if parse_utc(timestamp) > now
+    ]
+
+    if valid_times:
+        forecast_timestamp = max(
+            valid_times,
+            key=parse_utc,
+        )
+    elif future_times:
+        forecast_timestamp = min(
+            future_times,
+            key=parse_utc,
+        )
+    else:
+        raise ValueError("No usable forecast timestamp found.")
+    
     marine_index = marine_times.index(forecast_timestamp)
     weather_index_value = weather_index[forecast_timestamp]
 

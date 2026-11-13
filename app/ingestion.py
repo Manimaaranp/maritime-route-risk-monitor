@@ -8,10 +8,11 @@ import time
 import hashlib
 import re
 import math
-
+from app.spool import initialize_spool, save_event
 from datetime import datetime, timezone
 from pathlib import Path
-
+from app.kafka_client import create_kafka_producer, publish_event
+from app.publisher import publish_pending_events
 from dotenv import load_dotenv
 from kafka import KafkaProducer
 from websockets.asyncio.client import connect
@@ -27,8 +28,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / ".env")
 
 AISSTREAM_API_KEY = os.getenv("AISSTREAM_API_KEY")
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
-KAFKA_TOPIC = "vessel-events"
+
 
 WEBSOCKET_URL = "wss://stream.aisstream.io/v0/stream"
 
@@ -169,8 +169,23 @@ def get_fresh_weather(latitude, longitude):
             continue
 
         # Skip forecasts that have already expired.
-        if forecast_timestamp <= now:
-            logger.warning("Weather forecast expired for cell %s.", cell_id)
+        # Accept the current hourly forecast and reject forecasts
+# older than one hour.
+        forecast_age = (now - forecast_timestamp).total_seconds()
+
+        if forecast_age > 3600:
+            logger.warning(
+                "Weather forecast is too old for cell %s.",
+                cell_id,
+            )
+            continue
+
+        # Do not accept forecasts more than one hour in the future.
+        if forecast_age < -3600:
+            logger.warning(
+                "Weather forecast is too far in the future for cell %s.",
+                cell_id,
+            )
             continue
 
         lat_difference = latitude - location["latitude"]
@@ -372,48 +387,15 @@ def build_vessel_event(message):
 
 
 
-# --------------------------------------------------
-# Kafka producer
-# --------------------------------------------------
-
-def create_kafka_producer():
-    """Create a Kafka producer with JSON serialization."""
-
-    return KafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-        key_serializer=lambda key: key.encode("utf-8"),
-        value_serializer=lambda value: json.dumps(value).encode("utf-8"),
-        acks="all",
-        retries=5,
-    )
-
-
-def publish_event(producer, event):
-    """Publish one validated vessel event to Kafka."""
-
-    future = producer.send(
-        KAFKA_TOPIC,
-        key=event["mmsi"],
-        value=event,
-    )
-
-    metadata = future.get(timeout=10)
-
-    logger.info(
-        "Published MMSI %s | topic=%s | partition=%s | offset=%s",
-        event["mmsi"],
-        metadata.topic,
-        metadata.partition,
-        metadata.offset,
-    )
 
 
 # --------------------------------------------------
 # AISStream connection
 # --------------------------------------------------
 
-async def consume_ais(producer):
-    """Connect to AISStream and continuously publish vessel events."""
+
+async def consume_ais():
+    """Receive AIS events and persist them to the local SQLite spool."""
 
     subscription = {
         "APIKey": AISSTREAM_API_KEY,
@@ -469,18 +451,27 @@ async def consume_ais(producer):
                     if event is None:
                         continue
 
-                    try:
-                        await asyncio.to_thread(
-                            publish_event,
-                            producer,
-                            event,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Kafka publish failed for MMSI %s.",
+                    # Persist the event before attempting Kafka delivery.
+                    inserted = await asyncio.to_thread(
+                        save_event,
+                        event,
+                    )
+
+                    if inserted:
+                        logger.info(
+                            "Saved AIS event to SQLite spool | "
+                            "MMSI=%s | event_id=%s",
                             event["mmsi"],
+                            event["event_id"],
                         )
-                        raise
+                    else:
+                        logger.debug(
+                            "Duplicate AIS event already in spool | "
+                            "MMSI=%s | event_id=%s",
+                            event["mmsi"],
+                            event["event_id"],
+                        )
+
                 raise ConnectionError("AISStream WebSocket closed.")
 
         except asyncio.CancelledError:
@@ -497,7 +488,7 @@ async def consume_ais(producer):
             delay = random.uniform(backoff * 0.5, backoff)
 
             logger.error(
-                "AIS connection or publishing failed: %s: %s",
+                "AIS connection or spool persistence failed: %s: %s",
                 type(error).__name__,
                 error,
             )
@@ -511,9 +502,11 @@ async def consume_ais(producer):
             await asyncio.sleep(delay)
 
 
+
 # --------------------------------------------------
 # Application entry point
 # --------------------------------------------------
+
 
 async def main():
     if not AISSTREAM_API_KEY:
@@ -523,25 +516,47 @@ async def main():
 
     logger.info("Starting maritime ingestion service.")
 
+    initialize_spool()
+
     producer = create_kafka_producer()
 
     weather_task = asyncio.create_task(refresh_weather())
 
+    publisher_task = asyncio.create_task(
+        publish_pending_events(producer)
+    )
+
+    ingestion_task = asyncio.create_task(consume_ais())
+
     try:
-        await consume_ais(producer)
+        await asyncio.gather(
+            weather_task,
+            publisher_task,
+            ingestion_task,
+        )
 
     finally:
-        weather_task.cancel()
+        logger.info("Shutting down maritime ingestion service.")
 
-        try:
-            await weather_task
-        except asyncio.CancelledError:
-            pass
+        tasks = [
+            weather_task,
+            publisher_task,
+            ingestion_task,
+        ]
 
-        producer.flush()
-        producer.close()
+        for task in tasks:
+            task.cancel()
 
-        logger.info("Ingestion service stopped.")
+        await asyncio.gather(
+            *tasks,
+            return_exceptions=True,
+        )
+
+        await asyncio.to_thread(producer.flush)
+        await asyncio.to_thread(producer.close)
+
+        logger.info("Maritime ingestion service stopped.")
+
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+
 # Python
 __pycache__/
 *.py[cod]
@@ -20,10 +21,18 @@ venv/
 # Logs
 *.log
 
-# Spark checkpoints
+# Spark checkpoints and runtime data
 checkpoints/
+spark_checkpoints/
+data/spark_checkpoints/
 
-# Local database
+# Kafka runtime data
+kafka_data/
+
+# Local databases
 *.db
 *.sqlite
 *.sqlite3
+data/*.db
+data/*.db-shm
+data/*.db-wal
